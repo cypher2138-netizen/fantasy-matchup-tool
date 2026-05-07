@@ -66,18 +66,20 @@ function renderConfirm(matchup, data) {
   confirmView.innerHTML = `<section class="panel"><h2>Needs Confirmation</h2><div id="confirmList"></div><div class="actions"><button id="confirmBtn">Confirm and Calculate</button><button id="backBtn" class="secondary">Back to Edit Lineups</button></div></section>`;
   const list = document.getElementById('confirmList');
   unresolved.forEach((item, idx) => {
-    if (item.suggestions) {
+    if (item.suggestions && item.suggestions.length) {
       const options = item.suggestions.map(s => `<option value="${s.id}">${s.label}</option>`).join('');
       list.insertAdjacentHTML('beforeend', `<div class="suggestions"><h3>${item.slot}</h3><div class="small">Typed: ${item.typedName}</div><label>Choose match<select data-slot="${item.slot}"><option value="">-- choose --</option>${options}</select></label></div>`);
     } else {
-      list.insertAdjacentHTML('beforeend', `<div class="suggestions"><h3>${item.slot}</h3><div class="small">Could not match team entry: ${item.typedName}</div></div>`);
+      list.insertAdjacentHTML('beforeend', `<div class="suggestions"><h3>${item.slot}</h3><div class="small">No ESPN player candidate found for: ${item.typedName}</div></div>`);
     }
   });
   document.getElementById('backBtn').onclick = () => { confirmView.classList.add('hidden'); entryView.classList.remove('hidden'); };
   document.getElementById('confirmBtn').onclick = async () => {
     try {
       const resolutions = {};
-      confirmView.querySelectorAll('select[data-slot]').forEach(sel => { if (sel.value) resolutions[sel.dataset.slot] = sel.value; });
+      let missingChoice = false;
+      confirmView.querySelectorAll('select[data-slot]').forEach(sel => { if (sel.value) resolutions[sel.dataset.slot] = sel.value; else missingChoice = true; });
+      if (missingChoice) throw new Error('Please choose a match for each unresolved player before calculating.');
       const resp = await fetch('/api/matchups/resolve', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ matchup, resolutions }) });
       const out = await resp.json();
       if (!resp.ok || out.status === 'error') throw new Error(out.message || 'Resolve failed');

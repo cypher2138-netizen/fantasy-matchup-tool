@@ -171,22 +171,31 @@ function mergePlayerStats(existing, incoming) {
   return existing;
 }
 
+function flattenAthletes(node) {
+  if (!node) return [];
+  if (Array.isArray(node)) return node.flatMap(flattenAthletes);
+  const direct = [];
+  const maybeName = node?.athlete?.displayName || node?.displayName || node?.athlete?.shortName;
+  if (maybeName && Array.isArray(node?.stats)) direct.push(node);
+  if (Array.isArray(node?.athletes)) direct.push(...flattenAthletes(node.athletes));
+  if (Array.isArray(node?.items)) direct.push(...flattenAthletes(node.items));
+  if (Array.isArray(node?.leaders)) direct.push(...flattenAthletes(node.leaders));
+  return direct;
+}
+
 function extractStatMap(boxscoreGroup) {
   const result = {};
-  const labels = boxscoreGroup?.labels || [];
-  const athletes = boxscoreGroup?.athletes || [];
-  for (const athleteGroup of athletes) {
-    const entries = athleteGroup?.athletes || athleteGroup?.items || [];
-    for (const athlete of entries) {
-      const displayName = athlete?.athlete?.displayName || athlete?.displayName || athlete?.athlete?.shortName || '';
-      if (!displayName) continue;
-      const stats = athlete?.stats || [];
-      const map = {};
-      labels.forEach((label, idx) => {
-        map[String(label).toLowerCase()] = stats[idx];
-      });
-      result[displayName] = map;
-    }
+  const labels = (boxscoreGroup?.labels || []).map(l => String(l).toLowerCase());
+  const entries = flattenAthletes(boxscoreGroup?.athletes || []);
+  for (const athlete of entries) {
+    const displayName = athlete?.athlete?.displayName || athlete?.displayName || athlete?.athlete?.shortName || '';
+    if (!displayName) continue;
+    const stats = athlete?.stats || [];
+    const map = {};
+    labels.forEach((label, idx) => {
+      map[String(label).toLowerCase()] = stats[idx];
+    });
+    result[displayName] = map;
   }
   return result;
 }
@@ -246,19 +255,19 @@ function applySummaryData(summary, playersByName, teamsByAbbr) {
       for (const [displayName, statLine] of Object.entries(statMap)) {
         const base = playersByName.get(normalizeName(displayName)) || createEmptyPlayer(displayName, teamAbbr, gameId);
         const incoming = {};
-        if (category.includes('passing')) {
+        if (category.includes('passing') || category.includes('pass')) {
           incoming.passingYards = numberFromText(statLine['yds'] ?? statLine['yards']);
           incoming.passingTd = numberFromText(statLine['td'] ?? statLine['touchdowns']);
           incoming.passing2Pt = numberFromText(statLine['2pt'] ?? statLine['2pt conv'] ?? statLine['2pt conversions']);
-        } else if (category.includes('rushing')) {
+        } else if (category.includes('rushing') || category.includes('rush')) {
           incoming.rushingYards = numberFromText(statLine['yds'] ?? statLine['yards']);
           incoming.rushingTd = numberFromText(statLine['td'] ?? statLine['touchdowns']);
           incoming.rushing2Pt = numberFromText(statLine['2pt'] ?? statLine['2pt conv'] ?? statLine['2pt conversions']);
-        } else if (category.includes('receiving')) {
+        } else if (category.includes('receiving') || category.includes('receiv')) {
           incoming.receivingYards = numberFromText(statLine['yds'] ?? statLine['yards']);
           incoming.receivingTd = numberFromText(statLine['td'] ?? statLine['touchdowns']);
           incoming.receiving2Pt = numberFromText(statLine['2pt'] ?? statLine['2pt conv'] ?? statLine['2pt conversions']);
-        } else if (category.includes('kicking')) {
+        } else if (category.includes('kicking') || category.includes('kick')) {
           incoming.xpMade = parseMadeAttempt(statLine['xp'] ?? statLine['xpm']);
           const fgText = String(statLine['fg'] ?? statLine['fgm-l'] ?? '');
           incoming.fg0to39 = 0;
@@ -276,10 +285,10 @@ function applySummaryData(summary, playersByName, teamsByAbbr) {
           } else {
             incoming.fg0to39 = parseMadeAttempt(fgText);
           }
-        } else if (category.includes('defensive')) {
-          incoming.soloTackles = numberFromText(statLine['solo'] ?? statLine['tot']);
-          incoming.assistTackles = numberFromText(statLine['ast']);
-          const sacksRaw = numberFromText(statLine['sacks'] ?? statLine['sack']);
+        } else if (category.includes('defensive') || category.includes('defense')) {
+          incoming.soloTackles = numberFromText(statLine['solo'] ?? statLine['tot solo'] ?? statLine['total']);
+          incoming.assistTackles = numberFromText(statLine['ast'] ?? statLine['assisted']);
+          const sacksRaw = numberFromText(statLine['sacks'] ?? statLine['sack'] ?? statLine['sk']);
           incoming.soloSacks = Math.floor(sacksRaw);
           incoming.halfSacks = Math.round((sacksRaw - Math.floor(sacksRaw)) * 2) / 2;
           incoming.interceptions = numberFromText(statLine['int']);
@@ -316,10 +325,26 @@ async function fetchAndNormalizeWeekData(season, week) {
 function exactOrSuggestPlayer(inputName, playersByName) {
   const normalized = normalizeName(inputName);
   if (playersByName.has(normalized)) return { match: playersByName.get(normalized), suggestions: [] };
-  const inputTokens = new Set(normalized.split(' ').filter(Boolean));
+  const inputTokens = normalized.split(' ').filter(Boolean);
+  let strong = null;
+  for (const p of playersByName.values()) {
+    if (p.normalizedName === normalized) {
+      strong = p; break;
+    }
+    const pTokens = p.normalizedName.split(' ').filter(Boolean);
+    if (pTokens.length === inputTokens.length && pTokens.every((t, i) => t === inputTokens[i])) {
+      strong = p; break;
+    }
+  }
+  if (strong) return { match: strong, suggestions: [] };
   const suggestions = [...playersByName.values()]
-    .map(p => ({ ...p, score: [...inputTokens].filter(t => p.normalizedName.includes(t)).length }))
-    .filter(p => p.score > 0)
+    .map(p => {
+      const pTokens = p.normalizedName.split(' ').filter(Boolean);
+      const exactLast = inputTokens.length && pTokens.length && inputTokens[inputTokens.length - 1] === pTokens[pTokens.length - 1] ? 3 : 0;
+      const tokenMatches = inputTokens.filter(t => p.normalizedName.includes(t)).length;
+      return { ...p, score: tokenMatches + exactLast };
+    })
+    .filter(p => p.score > 1)
     .sort((a,b) => b.score - a.score || a.playerName.localeCompare(b.playerName))
     .slice(0,5)
     .map(p => ({ id: `player:${p.playerName}:${p.team}`, label: `${p.playerName} (${p.team})` }));
@@ -449,13 +474,13 @@ function collectResolutions(input, weekData) {
     for (const slot of ['qb','rb1','rb2','wr1','wr2','te','k','idp1','idp2','idp3','idp4']) {
       const name = input[teamKey].starters[slot];
       const { match, suggestions } = exactOrSuggestPlayer(name, weekData.playersByName);
-      if (!match) unresolvedPlayers.push({ slot: `${teamKey}.starters.${slot}`, typedName: name, suggestions });
+      if (!match) unresolvedPlayers.push({ slot: `${teamKey}.starters.${slot}`, typedName: name, suggestions, missing: !suggestions.length });
       else resolved[teamKey].starters[slot] = match;
     }
     for (const slot of ['qb','rb','wr']) {
       const name = input[teamKey].ot[slot];
       const { match, suggestions } = exactOrSuggestPlayer(name, weekData.playersByName);
-      if (!match) unresolvedPlayers.push({ slot: `${teamKey}.ot.${slot}`, typedName: name, suggestions });
+      if (!match) unresolvedPlayers.push({ slot: `${teamKey}.ot.${slot}`, typedName: name, suggestions, missing: !suggestions.length });
       else resolved[teamKey].ot[slot] = match;
     }
     for (const slot of ['teamOffense','teamDefense']) {
@@ -489,6 +514,10 @@ app.post('/api/matchups/calculate', async (req, res) => {
       return res.json({ status: 'ok', requiresConfirmation: true, unresolvedPlayers, unresolvedTeams, matchup: req.body });
     }
     const result = scoreMatchup(req.body, resolved);
+    const allZero = ['passing','rushing','receiving','total','idp','points'].every(k => result.teamAResults[k] === 0 && result.teamBResults[k] === 0);
+    if (allZero) {
+      return res.status(502).json({ status: 'error', message: 'ESPN stats were fetched, but player stat mapping returned all zeroes. This build needs updated ESPN parsing for this week.' });
+    }
     return res.json({ status: 'ok', requiresConfirmation: false, result });
   } catch (err) {
     console.error('calculate failed', err);
@@ -503,7 +532,15 @@ app.post('/api/matchups/resolve', async (req, res) => {
     if (error) return res.status(400).json({ status: 'error', message: error });
     const weekData = await fetchAndNormalizeWeekData(Number(matchup.season), Number(matchup.week));
     const resolved = applyResolutions(matchup, resolutions, weekData);
+    const stillUnresolved = collectResolutions(matchup, weekData).unresolvedPlayers.filter(p => !(resolutions||{})[p.slot]);
+    if (stillUnresolved.length) {
+      return res.status(400).json({ status: 'error', message: 'Please resolve all unmatched players before calculating.' });
+    }
     const result = scoreMatchup(matchup, resolved);
+    const allZero = ['passing','rushing','receiving','total','idp','points'].every(k => result.teamAResults[k] === 0 && result.teamBResults[k] === 0);
+    if (allZero) {
+      return res.status(502).json({ status: 'error', message: 'ESPN stats were fetched, but player stat mapping returned all zeroes. This build needs updated ESPN parsing for this week.' });
+    }
     return res.json({ status: 'ok', requiresConfirmation: false, result });
   } catch (err) {
     console.error('resolve failed', err);

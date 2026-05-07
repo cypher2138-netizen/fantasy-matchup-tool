@@ -5,7 +5,6 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
-const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -49,6 +48,10 @@ const REQUIRED_TEAM_SLOTS = [
   'qb','rb1','rb2','wr1','wr2','te','k','teamOffense','teamDefense','idp1','idp2','idp3','idp4'
 ];
 const REQUIRED_OT_SLOTS = ['qb','rb','wr'];
+const FETCH_TIMEOUT_MS = 15000;
+const SUMMARY_CONCURRENCY = 4;
+const CACHE_TTL_MS = 10 * 60 * 1000;
+const weekCache = new Map();
 
 function normalizeName(name='') {
   return String(name)
@@ -87,14 +90,37 @@ function validateMatchup(body) {
 }
 
 async function fetchJson(url) {
-  const resp = await fetch(url, { headers: { 'User-Agent': 'FantasyMatchupTool/0.1' } });
-  if (!resp.ok) throw new Error(`Fetch failed: ${resp.status} ${url}`);
-  return await resp.json();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'FantasyMatchupTool/0.2' },
+      signal: controller.signal,
+    });
+    if (!resp.ok) throw new Error(`Fetch failed: ${resp.status} ${url}`);
+    return await resp.json();
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function fetchWeekEvents(season, week) {
   const scoreboard = await fetchJson(`https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates=${season}&seasontype=2&week=${week}`);
   return scoreboard.events || [];
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = [];
+  let index = 0;
+  async function worker() {
+    while (index < items.length) {
+      const current = index++;
+      results[current] = await mapper(items[current], current);
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
 }
 
 function numberFromText(v) {
@@ -172,102 +198,119 @@ function classifyScoringPlayForDefense(playText='') {
   return { isSafety, isDefTd };
 }
 
+function applySummaryData(summary, playersByName, teamsByAbbr) {
+  const competitors = summary?.header?.competitions?.[0]?.competitors || [];
+  const gameId = summary?.header?.id || summary?.event?.id || '';
+
+  for (const comp of competitors) {
+    const abbr = comp?.team?.abbreviation;
+    if (!abbr) continue;
+    if (!teamsByAbbr.has(abbr)) {
+      teamsByAbbr.set(abbr, {
+        team: abbr,
+        gameId,
+        pointsScored: numberFromText(comp?.score),
+        pointsAllowed: 0,
+        defensiveTd: 0,
+        safeties: 0,
+      });
+    } else {
+      teamsByAbbr.get(abbr).pointsScored = numberFromText(comp?.score);
+      teamsByAbbr.get(abbr).gameId = gameId;
+    }
+  }
+
+  if (competitors.length === 2) {
+    const [a,b] = competitors;
+    const aAbbr = a?.team?.abbreviation;
+    const bAbbr = b?.team?.abbreviation;
+    if (aAbbr && teamsByAbbr.has(aAbbr)) teamsByAbbr.get(aAbbr).pointsAllowed = numberFromText(b?.score);
+    if (bAbbr && teamsByAbbr.has(bAbbr)) teamsByAbbr.get(bAbbr).pointsAllowed = numberFromText(a?.score);
+  }
+
+  const scoringPlays = summary?.scoringPlays || [];
+  for (const play of scoringPlays) {
+    const teamAbbr = play?.team?.abbreviation;
+    if (!teamAbbr || !teamsByAbbr.has(teamAbbr)) continue;
+    const flags = classifyScoringPlayForDefense(play?.text || '');
+    if (flags.isSafety) teamsByAbbr.get(teamAbbr).safeties += 1;
+    if (flags.isDefTd) teamsByAbbr.get(teamAbbr).defensiveTd += 1;
+  }
+
+  const boxPlayers = summary?.boxscore?.players || [];
+  for (const teamBlock of boxPlayers) {
+    const teamAbbr = teamBlock?.team?.abbreviation || '';
+    for (const statGroup of teamBlock?.statistics || []) {
+      const category = String(statGroup?.name || '').toLowerCase();
+      const statMap = extractStatMap(statGroup);
+      for (const [displayName, statLine] of Object.entries(statMap)) {
+        const base = playersByName.get(normalizeName(displayName)) || createEmptyPlayer(displayName, teamAbbr, gameId);
+        const incoming = {};
+        if (category.includes('passing')) {
+          incoming.passingYards = numberFromText(statLine['yds'] ?? statLine['yards']);
+          incoming.passingTd = numberFromText(statLine['td'] ?? statLine['touchdowns']);
+          incoming.passing2Pt = numberFromText(statLine['2pt'] ?? statLine['2pt conv'] ?? statLine['2pt conversions']);
+        } else if (category.includes('rushing')) {
+          incoming.rushingYards = numberFromText(statLine['yds'] ?? statLine['yards']);
+          incoming.rushingTd = numberFromText(statLine['td'] ?? statLine['touchdowns']);
+          incoming.rushing2Pt = numberFromText(statLine['2pt'] ?? statLine['2pt conv'] ?? statLine['2pt conversions']);
+        } else if (category.includes('receiving')) {
+          incoming.receivingYards = numberFromText(statLine['yds'] ?? statLine['yards']);
+          incoming.receivingTd = numberFromText(statLine['td'] ?? statLine['touchdowns']);
+          incoming.receiving2Pt = numberFromText(statLine['2pt'] ?? statLine['2pt conv'] ?? statLine['2pt conversions']);
+        } else if (category.includes('kicking')) {
+          incoming.xpMade = parseMadeAttempt(statLine['xp'] ?? statLine['xpm']);
+          const fgText = String(statLine['fg'] ?? statLine['fgm-l'] ?? '');
+          incoming.fg0to39 = 0;
+          incoming.fg40to49 = 0;
+          incoming.fg50plus = 0;
+          if (fgText.includes(',')) {
+            fgText.split(',').map(s => s.trim()).forEach(segment => {
+              const m = segment.match(/(\d+)/);
+              if (!m) return;
+              const dist = Number(m[1]);
+              if (dist >= 50) incoming.fg50plus += 1;
+              else if (dist >= 40) incoming.fg40to49 += 1;
+              else incoming.fg0to39 += 1;
+            });
+          } else {
+            incoming.fg0to39 = parseMadeAttempt(fgText);
+          }
+        } else if (category.includes('defensive')) {
+          incoming.soloTackles = numberFromText(statLine['solo'] ?? statLine['tot']);
+          incoming.assistTackles = numberFromText(statLine['ast']);
+          const sacksRaw = numberFromText(statLine['sacks'] ?? statLine['sack']);
+          incoming.soloSacks = Math.floor(sacksRaw);
+          incoming.halfSacks = Math.round((sacksRaw - Math.floor(sacksRaw)) * 2) / 2;
+          incoming.interceptions = numberFromText(statLine['int']);
+          incoming.forcedFumbles = numberFromText(statLine['ff']);
+          incoming.fumbleRecoveries = numberFromText(statLine['fr']);
+          incoming.defensiveTd = numberFromText(statLine['td']);
+        }
+        playersByName.set(base.normalizedName, mergePlayerStats(base, incoming));
+      }
+    }
+  }
+}
+
 async function fetchAndNormalizeWeekData(season, week) {
+  const cacheKey = `${season}-${week}`;
+  const cached = weekCache.get(cacheKey);
+  if (cached && (Date.now() - cached.createdAt < CACHE_TTL_MS)) return cached.data;
+
   const events = await fetchWeekEvents(season, week);
   const playersByName = new Map();
   const teamsByAbbr = new Map();
 
-  for (const event of events) {
+  await mapWithConcurrency(events, SUMMARY_CONCURRENCY, async (event) => {
     const gameId = event.id;
     const summary = await fetchJson(`https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary?event=${gameId}`);
-    const competitors = summary?.header?.competitions?.[0]?.competitors || [];
-    for (const comp of competitors) {
-      const abbr = comp?.team?.abbreviation;
-      if (!abbr) continue;
-      if (!teamsByAbbr.has(abbr)) {
-        teamsByAbbr.set(abbr, {
-          team: abbr,
-          gameId,
-          pointsScored: numberFromText(comp?.score),
-          pointsAllowed: 0,
-          defensiveTd: 0,
-          safeties: 0,
-        });
-      } else {
-        teamsByAbbr.get(abbr).pointsScored = numberFromText(comp?.score);
-      }
-    }
-    if (competitors.length === 2) {
-      const [a,b] = competitors;
-      const aAbbr = a?.team?.abbreviation;
-      const bAbbr = b?.team?.abbreviation;
-      if (aAbbr && teamsByAbbr.has(aAbbr)) teamsByAbbr.get(aAbbr).pointsAllowed = numberFromText(b?.score);
-      if (bAbbr && teamsByAbbr.has(bAbbr)) teamsByAbbr.get(bAbbr).pointsAllowed = numberFromText(a?.score);
-    }
+    applySummaryData(summary, playersByName, teamsByAbbr);
+  });
 
-    const scoringPlays = summary?.scoringPlays || [];
-    for (const play of scoringPlays) {
-      const teamAbbr = play?.team?.abbreviation;
-      if (!teamAbbr || !teamsByAbbr.has(teamAbbr)) continue;
-      const flags = classifyScoringPlayForDefense(play?.text || '');
-      if (flags.isSafety) teamsByAbbr.get(teamAbbr).safeties += 1;
-      if (flags.isDefTd) teamsByAbbr.get(teamAbbr).defensiveTd += 1;
-    }
-
-    const boxPlayers = summary?.boxscore?.players || [];
-    for (const teamBlock of boxPlayers) {
-      const teamAbbr = teamBlock?.team?.abbreviation || '';
-      for (const statGroup of teamBlock?.statistics || []) {
-        const category = String(statGroup?.name || '').toLowerCase();
-        const statMap = extractStatMap(statGroup);
-        for (const [displayName, statLine] of Object.entries(statMap)) {
-          const base = playersByName.get(normalizeName(displayName)) || createEmptyPlayer(displayName, teamAbbr, gameId);
-          const incoming = {};
-          if (category.includes('passing')) {
-            incoming.passingYards = numberFromText(statLine['yds'] ?? statLine['yards']);
-            incoming.passingTd = numberFromText(statLine['td'] ?? statLine['touchdowns']);
-            incoming.passing2Pt = numberFromText(statLine['2pt'] ?? statLine['2pt conv'] ?? statLine['2pt conversions']);
-          } else if (category.includes('rushing')) {
-            incoming.rushingYards = numberFromText(statLine['yds'] ?? statLine['yards']);
-            incoming.rushingTd = numberFromText(statLine['td'] ?? statLine['touchdowns']);
-            incoming.rushing2Pt = numberFromText(statLine['2pt'] ?? statLine['2pt conv'] ?? statLine['2pt conversions']);
-          } else if (category.includes('receiving')) {
-            incoming.receivingYards = numberFromText(statLine['yds'] ?? statLine['yards']);
-            incoming.receivingTd = numberFromText(statLine['td'] ?? statLine['touchdowns']);
-            incoming.receiving2Pt = numberFromText(statLine['2pt'] ?? statLine['2pt conv'] ?? statLine['2pt conversions']);
-          } else if (category.includes('kicking')) {
-            incoming.xpMade = parseMadeAttempt(statLine['xp'] ?? statLine['xpm']);
-            incoming.fg0to39 = parseMadeAttempt(statLine['fg'] ?? statLine['fgm-l']);
-            const fgText = String(statLine['fg'] ?? statLine['fgm-l'] ?? '');
-            if (fgText.includes(',')) {
-              incoming.fg0to39 = 0; incoming.fg40to49 = 0; incoming.fg50plus = 0;
-              fgText.split(',').map(s => s.trim()).forEach(segment => {
-                const m = segment.match(/(\d+)/);
-                if (!m) return;
-                const dist = Number(m[1]);
-                if (dist >= 50) incoming.fg50plus += 1;
-                else if (dist >= 40) incoming.fg40to49 += 1;
-                else incoming.fg0to39 += 1;
-              });
-            }
-          } else if (category.includes('defensive')) {
-            incoming.soloTackles = numberFromText(statLine['tot'] ?? statLine['solo']);
-            incoming.assistTackles = numberFromText(statLine['ast']);
-            const sacksRaw = numberFromText(statLine['sacks'] ?? statLine['sack']);
-            incoming.soloSacks = Math.floor(sacksRaw);
-            incoming.halfSacks = Math.round((sacksRaw - Math.floor(sacksRaw)) * 2) / 2;
-            incoming.interceptions = numberFromText(statLine['int']);
-            incoming.forcedFumbles = numberFromText(statLine['ff']);
-            incoming.fumbleRecoveries = numberFromText(statLine['fr']);
-            incoming.defensiveTd = numberFromText(statLine['td']);
-          }
-          playersByName.set(base.normalizedName, mergePlayerStats(base, incoming));
-        }
-      }
-    }
-  }
-
-  return { playersByName, teamsByAbbr, gamesFound: events.length };
+  const data = { playersByName, teamsByAbbr, gamesFound: events.length };
+  weekCache.set(cacheKey, { createdAt: Date.now(), data });
+  return data;
 }
 
 function exactOrSuggestPlayer(inputName, playersByName) {
@@ -302,12 +345,11 @@ function scoreIDPCategory(p) {
 }
 
 function compare(a,b) {
-  if (Math.abs(a-b) < 1e-9) return 'tie';
+  if (Math.abs(a-b) < 1e-9) return 'teamTie';
   return a > b ? 'teamA' : 'teamB';
 }
 
 function calcTeamTotals(teamInput, resolvedPlayers, resolvedTeams) {
-  const starters = teamInput.starters;
   const offenseSlots = ['qb','rb1','rb2','wr1','wr2','te'];
   const idpSlots = ['idp1','idp2','idp3','idp4'];
   const offense = offenseSlots.map(slot => resolvedPlayers[slot]);
@@ -327,7 +369,7 @@ function calcTeamTotals(teamInput, resolvedPlayers, resolvedTeams) {
   return { standingsPoints: 0, passing: passingYards, rushing: rushingYards, receiving: receivingYards, total, idp, offenseDefense, points };
 }
 
-function calcOT(teamInput, resolvedPlayers) {
+function calcOT(_teamInput, resolvedPlayers) {
   const offense = [resolvedPlayers.qb, resolvedPlayers.rb, resolvedPlayers.wr];
   const passing = offense.reduce((s,p)=>s+(p?.passingYards||0),0) / 1.5;
   const rushing = offense.reduce((s,p)=>s+(p?.rushingYards||0),0);
@@ -447,10 +489,10 @@ app.post('/api/matchups/calculate', async (req, res) => {
       return res.json({ status: 'ok', requiresConfirmation: true, unresolvedPlayers, unresolvedTeams, matchup: req.body });
     }
     const result = scoreMatchup(req.body, resolved);
-    res.json({ status: 'ok', requiresConfirmation: false, result });
+    return res.json({ status: 'ok', requiresConfirmation: false, result });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ status: 'error', message: 'Stats could not be fetched right now. Please try again.' });
+    console.error('calculate failed', err);
+    return res.status(500).json({ status: 'error', message: 'Stats could not be fetched right now. Please try again.' });
   }
 });
 
@@ -462,26 +504,25 @@ app.post('/api/matchups/resolve', async (req, res) => {
     const weekData = await fetchAndNormalizeWeekData(Number(matchup.season), Number(matchup.week));
     const resolved = applyResolutions(matchup, resolutions, weekData);
     const result = scoreMatchup(matchup, resolved);
-    res.json({ status: 'ok', requiresConfirmation: false, result });
+    return res.json({ status: 'ok', requiresConfirmation: false, result });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ status: 'error', message: 'Stats could not be fetched right now. Please try again.' });
+    console.error('resolve failed', err);
+    return res.status(500).json({ status: 'error', message: 'Stats could not be fetched right now. Please try again.' });
   }
 });
 
 app.get('/api/weeks/:season/:week/status', async (req, res) => {
   try {
     const events = await fetchWeekEvents(Number(req.params.season), Number(req.params.week));
-    res.json({ status: 'ok', season: Number(req.params.season), week: Number(req.params.week), gamesFound: events.length });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: 'Week status unavailable.' });
+    return res.json({ status: 'ok', season: Number(req.params.season), week: Number(req.params.week), gamesFound: events.length });
+  } catch (_err) {
+    return res.status(500).json({ status: 'error', message: 'Week status unavailable.' });
   }
 });
 
 app.get('/api/teams', (_req, res) => {
-  const teams = Object.entries(TEAM_ALIASES).map(([abbr, aliases]) => ({ abbr, name: aliases[aliases.length-1], aliases }));
-  res.json({ teams });
+  const teams = Object.entries(TEAM_ALIASES).map(([abbr, aliases]) => ({ abbr, name: aliases[aliases.length - 1], aliases }));
+  return res.json({ teams });
 });
 
 export default app;
-

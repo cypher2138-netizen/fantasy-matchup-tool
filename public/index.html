@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fantasy Matchup Calculator</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <h1>Fantasy Matchup Calculator</h1>
+    <p class="sub">Plain commissioner-style version. Uses ESPN week data through the backend.</p>
+    <div id="error" class="error hidden"></div>
+    <div id="entryView">
+      <section class="panel">
+        <h2>Matchup Info</h2>
+        <div class="grid four">
+          <label>Season <select id="season"></select></label>
+          <label>Week <select id="week"></select></label>
+          <label>Team A Name <input id="teamAName" /></label>
+          <label>Team B Name <input id="teamBName" /></label>
+        </div>
+      </section>
+      <div class="two-col">
+        <section class="panel" id="teamASection"></section>
+        <section class="panel" id="teamBSection"></section>
+      </div>
+      <div class="actions">
+        <button id="calcBtn">Fetch Stats and Calculate</button>
+        <button id="clearBtn" class="secondary">Clear Form</button>
+      </div>
+    </div>
+    <div id="confirmView" class="hidden"></div>
+    <div id="resultView" class="hidden"></div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

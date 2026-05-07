@@ -1,0 +1,13 @@
+body{font-family:Arial,Helvetica,sans-serif;background:#fff;color:#111;margin:0}
+.wrap{max-width:1200px;margin:0 auto;padding:20px}
+h1{margin-bottom:4px}.sub{margin-top:0;color:#555}
+.panel{border:1px solid #ccc;padding:16px;margin-bottom:16px}.panel h2,.panel h3{margin-top:0}
+.grid{display:grid;gap:12px}.grid.four{grid-template-columns:repeat(4,minmax(0,1fr))}.grid.two{grid-template-columns:repeat(2,minmax(0,1fr))}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+label{display:flex;flex-direction:column;font-size:14px;gap:4px}
+input,select{padding:8px;border:1px solid #999;font-size:14px}
+.actions{display:flex;gap:12px;margin:20px 0}button{padding:10px 14px;border:1px solid #222;background:#111;color:#fff;cursor:pointer}button.secondary{background:#fff;color:#111}
+.hidden{display:none}.error{background:#fee;border:1px solid #d66;color:#900;padding:12px;margin-bottom:12px}
+.summary{display:grid;grid-template-columns:1fr 1fr;gap:16px}.summary .block{border:1px solid #ccc;padding:16px}.winner{font-weight:700;font-size:20px;border:1px solid #ccc;padding:16px;margin-top:16px;background:#f7f7f7}
+.boldline{font-weight:700}.small{font-size:13px;color:#555}.suggestions{margin-bottom:12px;padding:12px;border:1px solid #ccc}.suggestions h3{margin-top:0}
+@media (max-width:900px){.grid.four,.summary,.two-col,.grid.two{grid-template-columns:1fr}}
